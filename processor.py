@@ -5,6 +5,7 @@ RANGE_NOTE_ON = 128
 RANGE_NOTE_OFF = 128
 RANGE_VEL = 32
 RANGE_TIME_SHIFT = 100
+RANGE_DURATION = 100
 
 START_IDX = {
     'note_on': 0,
@@ -204,12 +205,86 @@ def _note_preprocess(susteins, notes):
     return note_stream
 
 
-def encode_midi(file_path):
+def encode_midi_modified(file_path):
     events = []
     notes = []
     mid = pretty_midi.PrettyMIDI(midi_file=file_path)
 
     for inst in mid.instruments:
+        if inst.is_drum:
+            continue
+        inst_notes = inst.notes
+        # ctrl.number is the number of sustain control. If you want to know abour the number type of control,
+        # see https://www.midi.org/specifications-old/item/table-3-control-change-messages-data-bytes-2
+        ctrls = _control_preprocess([ctrl for ctrl in inst.control_changes if ctrl.number == 64])
+        notes += _note_preprocess(ctrls, inst_notes)
+        
+    notes.sort(key=lambda x: x.start)
+    
+    #  0  - 127 Note on
+    # 128 - 228 Duration
+    # 229 - 329 Timeshift
+    # 330 - 361 Velocity
+    cur_time, cur_vel = notes[0].start, notes[0].velocity // 4
+    
+    # Put in timeshifts to the start of the song
+    if cur_time > 0:
+        timeshift = round(cur_time * 100)
+        while timeshift > 100:
+            events.append(329)
+            timeshift -= 100
+        if timeshift > 0:
+            events.append(timeshift + 229)
+    
+    # Put in first note
+    events.append(min(cur_vel + 330, 361))
+    events.append(notes[0].pitch)
+    duration = max(1, round(notes[0].get_duration() * 100))
+    while duration > 100:
+        events.append(228)
+        duration -= 100
+    events.append(duration + 128)
+    
+    # Put in the rest if the notes
+    for note in notes[1:]:
+        # Put in timeshift events 
+        timeshift = round((note.start  - cur_time) * 100)
+        while timeshift > 100:
+            events.append(329)
+            timeshift -= 100
+        if timeshift > 0:
+            events.append(timeshift + 229)
+            cur_time = note.start
+        
+        # Put in velocity events
+        velocity = note.velocity // 4
+        if velocity != cur_vel:
+            events.append(min(velocity + 330, 361))
+            cur_vel = velocity
+
+        # Put in note on event
+        events.append(note.pitch)
+
+        # Put in duration events (10ms resolution)
+        duration = max(1, round(note.get_duration() * 100))
+        while duration > 100:
+            events.append(228)
+            duration -= 100
+        if duration > 0:
+            events.append(duration + 128)
+
+
+    return [int(e) for e in events]
+
+
+def encode_midi_original(file_path):
+    events = []
+    notes = []
+    mid = pretty_midi.PrettyMIDI(midi_file=file_path)
+
+    for inst in mid.instruments:
+        if inst.is_drum:
+            continue
         inst_notes = inst.notes
         # ctrl.number is the number of sustain control. If you want to know abour the number type of control,
         # see https://www.midi.org/specifications-old/item/table-3-control-change-messages-data-bytes-2
@@ -235,7 +310,7 @@ def encode_midi(file_path):
     return [e.to_int() for e in events]
 
 
-def decode_midi(idx_array, file_path=None):
+def decode_midi_original(idx_array, file_path=None):
     event_sequence = [Event.from_int(idx) for idx in idx_array]
     # print(event_sequence)
     snote_seq = _event_seq2snote_seq(event_sequence)
@@ -247,6 +322,33 @@ def decode_midi(idx_array, file_path=None):
     instument = pretty_midi.Instrument(1, False, "Developed By Yang-Kichang")
     instument.notes = note_seq
 
+    mid.instruments.append(instument)
+    if file_path is not None:
+        mid.write(file_path)
+    return mid
+
+
+def decode_midi_modified(idx_array, file_path=None):
+    mid = pretty_midi.PrettyMIDI()
+    instument = pretty_midi.Instrument(1, False, "Modified")
+    notes = []
+    cur_time, cur_vel = 0, 0
+    
+    #  0  - 127 Note on
+    # 128 - 228 Duration
+    # 229 - 329 Timeshift
+    # 330 - 361 Velocity
+    for event in idx_array:
+        if 0 <= event <= 127:
+            notes.append(pretty_midi.Note(cur_vel, event, cur_time, cur_time))
+        elif 128 <= event <= 228:
+            notes[-1].end += (event-128) / 100
+        elif 229 <= event <= 329:
+            cur_time += (event-229) / 100
+        elif 330 <= event <= 361:
+            cur_vel = (event-330) * 4
+
+    instument.notes = notes
     mid.instruments.append(instument)
     if file_path is not None:
         mid.write(file_path)
